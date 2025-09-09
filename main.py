@@ -10,13 +10,13 @@ from dotenv import load_dotenv
 # --- UPGRADED LANGCHAIN IMPORTS ---
 from langchain_groq import ChatGroq
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings # Switched to HuggingFace for consistency
+from langchain_huggingface import HuggingFaceEmbeddings 
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain # <-- IMPORT THE CONVERSATIONAL CHAIN
+from langchain.memory import ConversationBufferMemory   # <-- IMPORT THE MEMORY BUFFER
 from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 # Load environment variables from .env file for local development
 load_dotenv()
@@ -55,19 +55,29 @@ def get_db_connection():
     conn = psycopg2.connect(database_url)
     return conn
 
-# --- INITIALIZE ADVANCED LANGCHAIN COMPONENTS (GLOBALLY) ---
+# --- INITIALIZE LANGCHAIN COMPONENTS (GLOBALLY) ---
 # This is efficient as they are loaded only once when the server starts.
-print("Loading HuggingFace embedding model...")
+print("Loading HuggingFace embedding and cross-encoder models...")
 embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={'device': 'cpu'})
-print("Loading HuggingFace cross-encoder model for reranking...")
 cross_encoder_model = HuggingFaceCrossEncoder(model_name='cross-encoder/ms-marco-MiniLM-L-6-v2', model_kwargs={'device': 'cpu'})
 print("Models loaded successfully.")
+
+# --- SESSION MEMORY MANAGEMENT ---
+# In a production app, you'd use a more persistent store like Redis.
+# For now, a simple dictionary will hold memory for active sessions.
+# The key will be the businessId, and the value will be the memory object.
+session_memory = {}
 
 # --- API ENDPOINTS ---
 
 @app.get("/config/{business_id}")
 def get_config(business_id: str):
     """Fetches the configuration for a specific business."""
+    # This also serves as a good time to clear any old memory for a new session.
+    if business_id in session_memory:
+        del session_memory[business_id]
+        print(f"Cleared stale memory for session: {business_id}")
+
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -90,7 +100,7 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def chat_endpoint(request: ChatRequest):
     """
-    Handles chat requests using an advanced RAG chain with a Cross-Encoder Reranker.
+    Handles chat requests using a ConversationalRetrievalChain with memory.
     """
     try:
         conn = get_db_connection()
@@ -101,73 +111,54 @@ def chat_endpoint(request: ChatRequest):
         if not business:
             raise HTTPException(status_code=404, detail="Business configuration not found")
 
-        # --- ADVANCED LANGCHAIN RAG IMPLEMENTATION ---
+        # --- CONVERSATIONAL RAG IMPLEMENTATION ---
 
-        # 1. Load the FAISS vector store from the local file system
+        # 1. Load the FAISS vector store
         index_path = os.path.join("data", request.businessId)
-        if not os.path.exists(index_path) or not os.path.exists(os.path.join(index_path, "faiss_index.bin")):
+        if not os.path.exists(os.path.join(index_path, "faiss_index.bin")):
             return {"answer": "I'm sorry, the knowledge base for this business is currently unavailable. Please ask the administrator to train the agent."}
         
-        vector_store = FAISS.load_local(
-            index_path,
-            embeddings_model,
-            index_name="faiss_index.bin",
-            allow_dangerous_deserialization=True
+        vector_store = FAISS.load_local(index_path, embeddings_model, index_name="faiss_index.bin", allow_dangerous_deserialization=True)
+        
+        # 2. Create the Retriever with Reranker
+        base_retriever = vector_store.as_retriever(search_kwargs={'k': 5})
+        reranker = CrossEncoderReranker(model=cross_encoder_model, top_n=2)
+        compression_retriever = ContextualCompressionRetriever(base_compressor=reranker, base_retriever=base_retriever)
+
+        # 3. Define the LLM
+        llm = ChatGroq(temperature=0.7, model_name="llama3-70b-8192", groq_api_key=os.getenv("GROQ_API_KEY"))
+
+        # 4. Get or create a memory buffer for this specific business's session
+        if request.businessId not in session_memory:
+            session_memory[request.businessId] = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True,
+                output_key='answer' # Crucial for the chain to know where the answer is
+            )
+        memory = session_memory[request.businessId]
+
+        # 5. Create the ConversationalRetrievalChain
+        # This powerful chain handles memory, question rephrasing, and RAG.
+        # We can also add a custom prompt for the final answer generation.
+        condense_question_prompt = PromptTemplate.from_template(
+            "Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question.\n\nChat History:\n{chat_history}\nFollow Up Input: {question}\nStandalone question:"
         )
         
-        # 2. Create the Retriever and the Reranker
-        base_retriever = vector_store.as_retriever(search_kwargs={'k': 5}) # Get 5 potentially relevant docs
-        reranker = CrossEncoderReranker(model=cross_encoder_model, top_n=2) # Filter down to the best 2
-        
-        # 3. Create the Compression Retriever to combine the two steps
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=reranker, base_retriever=base_retriever
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=compression_retriever,
+            memory=memory,
+            condense_question_prompt=condense_question_prompt,
+            return_source_documents=False
         )
 
-        # 4. Define the LLM to use for generation
-        llm = ChatGroq(
-            temperature=0.7,
-            model_name="llama3-70b-8192",
-            groq_api_key=os.getenv("GROQ_API_KEY")
-        )
-
-        # 5. Define the Prompt Template with personality
-        prompt_template = """
-        You are a {personality} AI assistant for the company '{name}'.
-        Your primary goal is to answer the user's question based *only* on the following context.
-        If the information is not in the context, say that you don't have information on that topic. Do not make up answers.
-        Keep the answer concise and helpful.
-
-        Context:
-        {context}
-
-        Question:
-        {question}
-
-        Answer:"""
-        prompt = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
-        ).partial(personality=business['personality'], name=business['name'])
-
-        # 6. Define a helper function to format the retrieved documents
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        # 7. Build the final RAG chain using LangChain Expression Language (LCEL)
-        rag_chain = (
-            {"context": compression_retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-
-        # 8. Run the chain to get the final answer
-        final_answer = rag_chain.invoke(request.question)
+        # 6. Run the chain with the user's question to get the result
+        result = qa_chain.invoke({"question": request.question})
+        final_answer = result.get("answer", "Sorry, I encountered an issue while generating a response.")
         
-        # --- END OF ADVANCED IMPLEMENTATION ---
+        # --- END OF CONVERSATIONAL IMPLEMENTATION ---
         
-        # 9. Log the interaction to the database
+        # 7. Log the interaction to the database
         cursor.execute('INSERT INTO chat_logs (business_id, question, answer) VALUES (%s, %s, %s)', (request.businessId, request.question, final_answer))
         conn.commit()
         cursor.close()
