@@ -13,3 +13,4 @@ python-dotenv
 langchain
 langchain-groq
 langchain-community  # For FAISS and other integrations
+langchain-huggingface
