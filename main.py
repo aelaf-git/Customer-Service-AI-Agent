@@ -63,7 +63,7 @@ cross_encoder_model = HuggingFaceCrossEncoder(model_name='cross-encoder/ms-marco
 print("Models loaded successfully.")
 
 # --- SESSION MEMORY MANAGEMENT ---
-# In a production app, you'd use a more persistent store like Redis.
+
 # For now, a simple dictionary will hold memory for active sessions.
 # The key will be the businessId, and the value will be the memory object.
 session_memory = {}
@@ -126,7 +126,7 @@ def chat_endpoint(request: ChatRequest):
         compression_retriever = ContextualCompressionRetriever(base_compressor=reranker, base_retriever=base_retriever)
 
         # 3. Define the LLM
-        llm = ChatGroq(temperature=0.7, model_name="llama3-70b-8192", groq_api_key=os.getenv("GROQ_API_KEY"))
+        llm = ChatGroq(temperature=0.7, model_name="openai/gpt-oss-120b", groq_api_key=os.getenv("GROQ_API_KEY"))
 
         # 4. Get or create a memory buffer for this specific business's session
         if request.businessId not in session_memory:

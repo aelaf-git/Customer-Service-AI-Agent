@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-gunicorn  # <-- Important for production
+gunicorn 
 streamlit
 psycopg2-binary
 sentence-transformers
@@ -12,5 +12,5 @@ requests
 python-dotenv
 langchain
 langchain-groq
-langchain-community  # For FAISS and other integrations
+langchain-community
 langchain-huggingface
